@@ -54,6 +54,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * A checkpoint for OpenSearch operations
@@ -71,10 +73,13 @@ public final class Checkpoint {
     final long globalCheckpoint;
     final long minTranslogGeneration;
     final long trimmedAboveSeqNo;
+    // translogChecksum is not declared as final since the checksum for translog file is not available readily.
+    // It is available once the TranslogCheckedContainer is initialised for the same.
+    // Therefore, we will be setting it using a setter method.
+    long translogChecksum;
 
     private static final int VERSION_LUCENE_BIG_ENDIAN = 3; // big endian format (Lucene 9+ switches to little endian)
-    private static final int CURRENT_VERSION = 4; // introduction of trimmed above seq#
-
+    private static final int CURRENT_VERSION = 5; // introduction of translog checksum
     private static final String CHECKPOINT_CODEC = "ckp";
 
     static final int V4_FILE_SIZE = CodecUtil.headerLength(CHECKPOINT_CODEC) + Integer.BYTES  // ops
@@ -86,6 +91,21 @@ public final class Checkpoint {
         + Long.BYTES // minimum translog generation in the translog
         + Long.BYTES // maximum reachable (trimmed) sequence number
         + CodecUtil.footerLength();
+
+    static final int V5_FILE_SIZE = V4_FILE_SIZE // Existing V4 File size
+        + Long.BYTES; // translog checksum
+
+    // CHECKPOINT_VERSION_MAP is a map of checkpoint versions and the corresponding size of the file for that version.
+    private static final Map<Integer, Integer> SUPPORTED_CHECKPOINT_VERSION_MAP = new HashMap<>() {
+        {
+            put(3, null); // big endian format (Lucene 9+ switches to little endian)
+            put(4, V4_FILE_SIZE); // introduction of trimmed above seq#
+            put(5, V5_FILE_SIZE); // introduction of translog checksum
+        }
+    };
+
+    // EMPTY_TRANSLOG_CHECKSUM is the checksum associated with empty translog or older unsupported versions.
+    private static final long EMPTY_TRANSLOG_CHECKSUM = -1;
 
     /**
      * Create a new translog checkpoint.
@@ -125,6 +145,7 @@ public final class Checkpoint {
         this.globalCheckpoint = globalCheckpoint;
         this.minTranslogGeneration = minTranslogGeneration;
         this.trimmedAboveSeqNo = trimmedAboveSeqNo;
+        this.translogChecksum = EMPTY_TRANSLOG_CHECKSUM;
     }
 
     private void write(DataOutput out) throws IOException {
@@ -136,6 +157,7 @@ public final class Checkpoint {
         out.writeLong(globalCheckpoint);
         out.writeLong(minTranslogGeneration);
         out.writeLong(trimmedAboveSeqNo);
+        out.writeLong(translogChecksum);
     }
 
     /**
@@ -161,11 +183,18 @@ public final class Checkpoint {
         return new Checkpoint(offset, 0, generation, minSeqNo, maxSeqNo, globalCheckpoint, minTranslogGeneration, trimmedAboveSeqNo);
     }
 
-    static Checkpoint readCheckpointV3(final DataInput in) throws IOException {
-        return readCheckpointV4(EndiannessReverserUtil.wrapDataInput(in));
+    static Checkpoint readCheckpointForVersion(final DataInput in, final int version) throws IOException {
+        switch (version) {
+            case 3:
+                return Checkpoint.readCheckpoint(EndiannessReverserUtil.wrapDataInput(in), version);
+            case 4:
+            case 5:
+            default:
+                return Checkpoint.readCheckpoint(in, version);
+        }
     }
 
-    static Checkpoint readCheckpointV4(final DataInput in) throws IOException {
+    static Checkpoint readCheckpoint(final DataInput in, final int version) throws IOException {
         final long offset = in.readLong();
         final int numOps = in.readInt();
         final long generation = in.readLong();
@@ -174,7 +203,22 @@ public final class Checkpoint {
         final long globalCheckpoint = in.readLong();
         final long minTranslogGeneration = in.readLong();
         final long trimmedAboveSeqNo = in.readLong();
-        return new Checkpoint(offset, numOps, generation, minSeqNo, maxSeqNo, globalCheckpoint, minTranslogGeneration, trimmedAboveSeqNo);
+        Checkpoint checkpoint = new Checkpoint(
+            offset,
+            numOps,
+            generation,
+            minSeqNo,
+            maxSeqNo,
+            globalCheckpoint,
+            minTranslogGeneration,
+            trimmedAboveSeqNo
+        );
+
+        if (version >= 5) {
+            checkpoint.translogChecksum = in.readLong();
+        }
+
+        return checkpoint;
     }
 
     @Override
@@ -196,6 +240,8 @@ public final class Checkpoint {
             + minTranslogGeneration
             + ", trimmedAboveSeqNo="
             + trimmedAboveSeqNo
+            + ", translogChecksum="
+            + translogChecksum
             + '}';
     }
 
@@ -205,9 +251,12 @@ public final class Checkpoint {
                 // We checksum the entire file before we even go and parse it. If it's corrupted we barf right here.
                 CodecUtil.checksumEntireFile(indexInput);
                 final int fileVersion = CodecUtil.checkHeader(indexInput, CHECKPOINT_CODEC, VERSION_LUCENE_BIG_ENDIAN, CURRENT_VERSION);
-                assert fileVersion == CURRENT_VERSION || fileVersion == VERSION_LUCENE_BIG_ENDIAN : fileVersion;
-                assert indexInput.length() == V4_FILE_SIZE : indexInput.length();
-                return fileVersion == CURRENT_VERSION ? Checkpoint.readCheckpointV4(indexInput) : Checkpoint.readCheckpointV3(indexInput);
+                // Check if the file version of checkpoint is in our supported list.
+                assert SUPPORTED_CHECKPOINT_VERSION_MAP.containsKey(fileVersion) : fileVersion;
+                // If we need to compare the size of the file for the given version, we will assert the same.
+                assert SUPPORTED_CHECKPOINT_VERSION_MAP.get(fileVersion) == null
+                    || indexInput.length() == SUPPORTED_CHECKPOINT_VERSION_MAP.get(fileVersion) : indexInput.length();
+                return Checkpoint.readCheckpointForVersion(indexInput, fileVersion);
             } catch (CorruptIndexException | NoSuchFileException | IndexFormatTooOldException | IndexFormatTooNewException e) {
                 throw new TranslogCorruptedException(path.toString(), e);
             }
@@ -236,7 +285,10 @@ public final class Checkpoint {
     }
 
     public static byte[] createCheckpointBytes(Path checkpointFile, Checkpoint checkpoint) throws IOException {
-        final ByteArrayOutputStream byteOutputStream = new ByteArrayOutputStream(V4_FILE_SIZE) {
+        final Integer CURRENT_VERSION_FILE_SIZE = SUPPORTED_CHECKPOINT_VERSION_MAP.get(CURRENT_VERSION);
+        assert CURRENT_VERSION_FILE_SIZE != null : CURRENT_VERSION + " has file file size set as null";
+
+        final ByteArrayOutputStream byteOutputStream = new ByteArrayOutputStream(CURRENT_VERSION_FILE_SIZE) {
             @Override
             public synchronized byte[] toByteArray() {
                 // don't clone
@@ -249,17 +301,17 @@ public final class Checkpoint {
                 resourceDesc,
                 checkpointFile.toString(),
                 byteOutputStream,
-                V4_FILE_SIZE
+                CURRENT_VERSION_FILE_SIZE
             )
         ) {
             CodecUtil.writeHeader(indexOutput, CHECKPOINT_CODEC, CURRENT_VERSION);
             checkpoint.write(indexOutput);
             CodecUtil.writeFooter(indexOutput);
 
-            assert indexOutput.getFilePointer() == V4_FILE_SIZE : "get you numbers straight; bytes written: "
+            assert indexOutput.getFilePointer() == CURRENT_VERSION_FILE_SIZE : "get you numbers straight; bytes written: "
                 + indexOutput.getFilePointer()
                 + ", buffer size: "
-                + V4_FILE_SIZE;
+                + CURRENT_VERSION_FILE_SIZE;
             assert indexOutput.getFilePointer() < 512 : "checkpoint files have to be smaller than 512 bytes for atomic writes; size: "
                 + indexOutput.getFilePointer();
         }
@@ -272,6 +324,14 @@ public final class Checkpoint {
 
     public long getGeneration() {
         return generation;
+    }
+
+    public void setTranslogChecksum(final long translogChecksum) {
+        this.translogChecksum = translogChecksum;
+    }
+
+    public long getTranslogChecksum() {
+        return translogChecksum;
     }
 
     @Override
@@ -287,7 +347,8 @@ public final class Checkpoint {
         if (minSeqNo != that.minSeqNo) return false;
         if (maxSeqNo != that.maxSeqNo) return false;
         if (globalCheckpoint != that.globalCheckpoint) return false;
-        return trimmedAboveSeqNo == that.trimmedAboveSeqNo;
+        if (trimmedAboveSeqNo != that.trimmedAboveSeqNo) return false;
+        return translogChecksum == that.translogChecksum;
     }
 
     @Override
@@ -299,6 +360,7 @@ public final class Checkpoint {
         result = 31 * result + Long.hashCode(maxSeqNo);
         result = 31 * result + Long.hashCode(globalCheckpoint);
         result = 31 * result + Long.hashCode(trimmedAboveSeqNo);
+        result = 31 * result + Long.hashCode(translogChecksum);
         return result;
     }
 

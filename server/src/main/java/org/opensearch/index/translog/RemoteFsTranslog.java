@@ -254,14 +254,68 @@ public class RemoteFsTranslog extends Translog {
                 Files.createDirectories(location);
             }
 
-            // Delete translog files on local before downloading from remote
+            Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
+            Map<String, String> generationToChecksumMapper = translogMetadata.getGenerationToChecksumMapper();
+            long maxGeneration = translogMetadata.getGeneration();
+            long minGeneration = translogMetadata.getMinTranslogGeneration();
+
+            // Delete any translog and checkpoint file which is not part of the current generation range.
             for (Path file : FileSystemUtils.files(location)) {
-                Files.delete(file);
+                try {
+                    long generation = parseIdFromFileName(file.getFileName().toString(), STRICT_TLOG_OR_CKP_PATTERN);
+                    if (generation < minGeneration || generation > maxGeneration) {
+                        // If the generation is outside the required range, then we delete the same.
+                        Files.delete(file);
+                    }
+                } catch (IllegalStateException | IllegalArgumentException e) {
+                    // Delete any file which does not conform to Translog or Checkpoint filename patterns.
+                    Files.delete(file);
+                }
             }
 
-            Map<String, String> generationToPrimaryTermMapper = translogMetadata.getGenerationToPrimaryTermMapper();
-            for (long i = translogMetadata.getGeneration(); i >= translogMetadata.getMinTranslogGeneration(); i--) {
+            for (long i = maxGeneration; i >= minGeneration; i--) {
                 String generation = Long.toString(i);
+
+                // For incremental downloads, we will check if the local translog matches the one present in
+                // remote store. If so, we will skip it's download.
+                String translogFilename = getFilename(i);
+                String checkpointFilename = getCommitCheckpointFileName(i);
+                Path targetTranslogPath = location.resolve(translogFilename);
+                Path targetCkpPath = location.resolve(checkpointFilename);
+                final boolean isTranslogPresent = FileSystemUtils.exists(targetTranslogPath);
+                final boolean isCheckpointPresent = FileSystemUtils.exists(targetCkpPath);
+
+                // If we have the translog available for the generation then we need to
+                // compare the checksum with that in remote obtained via metadata.
+                // For backward compatibility, we consider the following cases here-
+                // - Remote metadata does not have the mapping for generation
+                // - Local checkpoint lacks the checksum value (Will be set to default -1)
+                // In both these cases, we will delete the local files, if any, for the generation.
+                if (generationToChecksumMapper.containsKey(generation) && isTranslogPresent) {
+
+                    if (!isCheckpointPresent) {
+                        throw new FileNotFoundException(
+                            "Translog file for generation " + generation + "found without the corresponding checkpoint file"
+                        );
+                    }
+
+                    Checkpoint targetCkp = Checkpoint.read(targetCkpPath);
+                    final long expectedChecksum = Long.parseLong(generationToChecksumMapper.get(generation));
+                    // If the local and remote checksum are same, then continue.
+                    // Else exit the loop and download the translog.
+                    if (targetCkp.getTranslogChecksum() == expectedChecksum) {
+                        logger.info(
+                            "Download skipped for translog and checkpoint files for generation={} due to them being locally present",
+                            generation
+                        );
+                        // Mark the translog and checkpoint file as downloaded in the file tracker.
+                        translogTransferManager.markFileAsDownloaded(translogFilename);
+                        translogTransferManager.markFileAsDownloaded(checkpointFilename);
+                        continue;
+                    }
+                }
+
+                logger.info("Downloading translog and checkpoint files for generation={}", generation);
                 translogTransferManager.downloadTranslog(generationToPrimaryTermMapper.get(generation), generation, location);
             }
             logger.info(

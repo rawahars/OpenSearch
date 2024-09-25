@@ -1690,8 +1690,10 @@ public class RemoteFsTranslogTests extends OpenSearchTestCase {
         Path location = createTempDir();
         TranslogTransferMetadata translogTransferMetadata = new TranslogTransferMetadata(primaryTerm, generation, generation, 1);
         Map<String, String> generationToPrimaryTermMapper = new HashMap<>();
+        Map<String, String> generationToChecksumMapper = new HashMap<>();
         generationToPrimaryTermMapper.put(String.valueOf(generation), String.valueOf(primaryTerm));
         translogTransferMetadata.setGenerationToPrimaryTermMapper(generationToPrimaryTermMapper);
+        translogTransferMetadata.setGenerationToChecksumMapper(generationToChecksumMapper);
 
         TranslogTransferManager mockTransfer = mock(TranslogTransferManager.class);
         RemoteTranslogTransferTracker remoteTranslogTransferTracker = mock(RemoteTranslogTransferTracker.class);

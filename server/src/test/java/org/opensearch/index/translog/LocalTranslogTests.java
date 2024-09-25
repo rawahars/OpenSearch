@@ -2059,9 +2059,9 @@ public class LocalTranslogTests extends OpenSearchTestCase {
             translogCorruptedException.getMessage(),
             endsWith(
                 "] is corrupted, checkpoint file translog-3.ckp already exists but has corrupted content: expected Checkpoint{offset=2750, "
-                    + "numOps=55, generation=3, minSeqNo=45, maxSeqNo=99, globalCheckpoint=-1, minTranslogGeneration=1, trimmedAboveSeqNo=-2} "
+                    + "numOps=55, generation=3, minSeqNo=45, maxSeqNo=99, globalCheckpoint=-1, minTranslogGeneration=1, trimmedAboveSeqNo=-2, translogChecksum=-1} "
                     + "but got Checkpoint{offset=0, numOps=0, generation=0, minSeqNo=-1, maxSeqNo=-1, globalCheckpoint=-1, "
-                    + "minTranslogGeneration=0, trimmedAboveSeqNo=-2}"
+                    + "minTranslogGeneration=0, trimmedAboveSeqNo=-2, translogChecksum=-1}"
             )
         );
         Checkpoint.write(

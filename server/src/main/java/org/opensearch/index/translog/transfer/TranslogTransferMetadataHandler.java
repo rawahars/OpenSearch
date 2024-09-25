@@ -40,6 +40,15 @@ public class TranslogTransferMetadataHandler implements IndexIOStreamHandler<Tra
         TranslogTransferMetadata metadata = new TranslogTransferMetadata(primaryTerm, generation, minTranslogGeneration, count);
         metadata.setGenerationToPrimaryTermMapper(generationToPrimaryTermMapper);
 
+        // We set the GenerationToChecksumMapper only if it is present in the file.
+        // Else we initialise it with an empty map.
+        if (indexInput.getFilePointer() < indexInput.length()) {
+            Map<String, String> generationToChecksumMapper = indexInput.readMapOfStrings();
+            metadata.setGenerationToChecksumMapper(generationToChecksumMapper);
+        } else {
+            metadata.setGenerationToChecksumMapper(new HashMap<>());
+        }
+
         return metadata;
     }
 
@@ -56,6 +65,12 @@ public class TranslogTransferMetadataHandler implements IndexIOStreamHandler<Tra
         indexOutput.writeLong(content.getMinTranslogGeneration());
         if (content.getGenerationToPrimaryTermMapper() != null) {
             indexOutput.writeMapOfStrings(content.getGenerationToPrimaryTermMapper());
+        } else {
+            indexOutput.writeMapOfStrings(new HashMap<>());
+        }
+        // Write the generation to checksum mapping at the end.
+        if (content.getGenerationToChecksumMapper() != null) {
+            indexOutput.writeMapOfStrings(content.getGenerationToChecksumMapper());
         } else {
             indexOutput.writeMapOfStrings(new HashMap<>());
         }

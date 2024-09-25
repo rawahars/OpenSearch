@@ -405,7 +405,7 @@ public class TranslogWriter extends BaseTranslogReader implements Closeable {
 
     @Override
     synchronized Checkpoint getCheckpoint() {
-        return new Checkpoint(
+        Checkpoint checkpoint = new Checkpoint(
             totalOffset,
             operationCounter,
             generation,
@@ -415,6 +415,11 @@ public class TranslogWriter extends BaseTranslogReader implements Closeable {
             minTranslogGenerationSupplier.getAsLong(),
             SequenceNumbers.UNASSIGNED_SEQ_NO
         );
+        if (translogCheckedContainer != null) {
+            checkpoint.translogChecksum = translogCheckedContainer.getChecksum();
+        }
+
+        return checkpoint;
     }
 
     @Override
@@ -528,6 +533,11 @@ public class TranslogWriter extends BaseTranslogReader implements Closeable {
                         try {
                             // Write ops will release operations.
                             writeAndReleaseOps(toWrite);
+                            if (translogCheckedContainer != null) {
+                                // For remote FS, we will have initialised the checked container at this point and can use it to
+                                // obtain the checksum.
+                                checkpointToSync.setTranslogChecksum(translogCheckedContainer.getChecksum());
+                            }
                         } catch (final Exception ex) {
                             closeWithTragicEvent(ex);
                             throw ex;
